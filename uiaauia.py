@@ -19,7 +19,6 @@ import random
 import contextlib
 import seaborn as sns
 from tqdm import tqdm
-from stopwordsiso import stopwords as stopwords_iso
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +40,6 @@ class TextProcessor:
     def __init__(self, max_length=512):
         self.max_length = max_length
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
-        self.stop_words = set(stopwords_iso("en")).union(stopwords_iso("tl"))
         
     def preprocess(self, text):
         text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
@@ -96,8 +94,12 @@ class EfficientTextClassifier(nn.Module):
         self.bert = BertModel.from_pretrained('bert-base-multilingual-cased')
         self.bert_embedding_dim = self.bert.config.hidden_size
         
-        for param in self.bert.parameters():
-            param.requires_grad = False
+        # Selectively unfreeze top 3 BERT layers
+        for name, param in self.bert.named_parameters():
+            if any(layer_name in name for layer_name in ['layer.9', 'layer.10', 'layer.11', 'pooler']):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
             
         self.projection = nn.Linear(self.bert_embedding_dim, hidden_dim)
         
@@ -110,25 +112,17 @@ class EfficientTextClassifier(nn.Module):
         
         self.conv = nn.Conv1d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1)
         
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
-            nn.Softmax(dim=1)
-        )
-        
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, num_classes)
-            # Removed Sigmoid since we'll use BCEWithLogitsLoss
         )
     
     def forward(self, input_ids, attention_mask=None):
-        with torch.no_grad():
-            bert_outputs = self.bert(input_ids, attention_mask=attention_mask)
-            embedded = bert_outputs.last_hidden_state
+        # No longer using torch.no_grad() since we're fine-tuning top layers
+        bert_outputs = self.bert(input_ids, attention_mask=attention_mask)
+        embedded = bert_outputs.last_hidden_state
         
         projected = self.projection(embedded)
         
@@ -140,11 +134,41 @@ class EfficientTextClassifier(nn.Module):
         cnn_out = self.conv(lstm_out)
         cnn_out = cnn_out.permute(0, 2, 1)
         
-        attn_weights = self.attention(cnn_out)
-        context = torch.sum(attn_weights * cnn_out, dim=1)
+        # Replace attention with global max pooling
+        context = torch.max(cnn_out, dim=1)[0]
         
         output = self.classifier(context)
         return output
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, pos_weight, gamma=2.0, correlation_matrix=None):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.gamma = gamma
+        self.correlation_matrix = correlation_matrix
+        
+    def forward(self, inputs, targets):
+        bce_loss = F.binary_cross_entropy_with_logits(
+            inputs, targets, pos_weight=self.pos_weight, reduction='none'
+        )
+        
+        probs = torch.sigmoid(inputs)
+        pt = probs * targets + (1 - probs) * (1 - targets)
+        focal_weight = (1 - pt) ** self.gamma
+        
+        if self.correlation_matrix is not None:
+            batch_size = inputs.size(0)
+            corr_penalty = 0
+            
+            for i in range(inputs.size(1)):
+                for j in range(inputs.size(1)):
+                    if self.correlation_matrix[i,j] < -0.3:
+                        corr_penalty += torch.sum(probs[:, i] * probs[:, j]) / batch_size
+            
+            return (focal_weight * bce_loss).mean() + 0.1 * corr_penalty
+        else:
+            return (focal_weight * bce_loss).mean()
 
 
 class TextClassificationTrainer:
@@ -198,6 +222,7 @@ class TextClassificationTrainer:
         val_loss = 0
         all_preds = []
         all_labels = []
+        all_probs = []
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Evaluating"):
@@ -210,56 +235,76 @@ class TextClassificationTrainer:
                 loss = self.criterion(outputs, labels)
                 val_loss += loss.item()
                 
-                # Apply sigmoid for predictions since we're using BCEWithLogitsLoss
-                preds = (torch.sigmoid(outputs) > 0.5).float()
+                probs = torch.sigmoid(outputs)
+                preds = (probs > 0.5).float()
+                
+                all_probs.append(probs.cpu().numpy())
                 all_preds.append(preds.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
         
+        all_probs = np.vstack(all_probs)
         all_preds = np.vstack(all_preds)
         all_labels = np.vstack(all_labels)
         
         accuracy = accuracy_score(all_labels.flatten(), all_preds.flatten())
         f1 = f1_score(all_labels, all_preds, average='micro')
         
-        return val_loss / len(self.val_loader), accuracy, f1
+        # Calculate ROC-AUC for each class
+        roc_auc_scores = []
+        for i in range(all_labels.shape[1]):
+            try:
+                roc_auc = roc_auc_score(all_labels[:, i], all_probs[:, i])
+                roc_auc_scores.append(roc_auc)
+            except ValueError:
+                # Handle case where there's only one class in the ground truth
+                roc_auc_scores.append(0.5)
+                
+        avg_roc_auc = np.mean(roc_auc_scores)
+        
+        return val_loss / len(self.val_loader), accuracy, f1, avg_roc_auc
     
     def train(self, num_epochs, patience=3):
-        logger.info(f"Starting training for {num_epochs} epochs")
-        
-        best_val_loss = float('inf')
-        no_improvement = 0
-        
-        for epoch in range(num_epochs):
-            train_loss = self.train_epoch()
+        try:
+            logger.info(f"Starting training for {num_epochs} epochs")
             
-            val_loss, accuracy, f1 = self.evaluate()
+            best_val_loss = float('inf')
+            no_improvement = 0
             
-            if self.scheduler:
-                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step(val_loss)
+            for epoch in range(num_epochs):
+                train_loss = self.train_epoch()
+                
+                val_loss, accuracy, f1, roc_auc = self.evaluate()
+                
+                if self.scheduler:
+                    if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                        self.scheduler.step(val_loss)
+                    else:
+                        self.scheduler.step()
+                
+                logger.info(f"Epoch {epoch+1}/{num_epochs} - "
+                            f"Train Loss: {train_loss:.4f}, "
+                            f"Val Loss: {val_loss:.4f}, "
+                            f"Accuracy: {accuracy:.4f}, "
+                            f"F1: {f1:.4f}, "
+                            f"ROC-AUC: {roc_auc:.4f}")
+                
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    no_improvement = 0
+                    
+                    self.save_model()
+                    logger.info(f"New best model saved with validation loss: {val_loss:.4f}")
                 else:
-                    self.scheduler.step()
-            
-            logger.info(f"Epoch {epoch+1}/{num_epochs} - "
-                        f"Train Loss: {train_loss:.4f}, "
-                        f"Val Loss: {val_loss:.4f}, "
-                        f"Accuracy: {accuracy:.4f}, "
-                        f"F1: {f1:.4f}")
-            
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                no_improvement = 0
-                
-                self.save_model()
-                logger.info(f"New best model saved with validation loss: {val_loss:.4f}")
-            else:
-                no_improvement += 1
-                
-            if no_improvement >= patience:
-                logger.info(f"Early stopping at epoch {epoch+1}")
-                break
-                
-        logger.info("Training completed")
+                    no_improvement += 1
+                    
+                if no_improvement >= patience:
+                    logger.info(f"Early stopping at epoch {epoch+1}")
+                    break
+                    
+            logger.info("Training completed")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
     def save_model(self):
         torch.save({
@@ -268,21 +313,70 @@ class TextClassificationTrainer:
         }, self.model_path)
     
     def load_model(self):
-        if os.path.exists(self.model_path):
-            checkpoint = torch.load(self.model_path)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            logger.info(f"Model loaded from {self.model_path}")
+        try:
+            if os.path.exists(self.model_path):
+                checkpoint = torch.load(self.model_path, map_location=self.device)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                logger.info(f"Model loaded from {self.model_path}")
+                return True
+            else:
+                logger.error(f"No model found at {self.model_path}")
+                return False
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            return False
+
+
+def optimize_thresholds(model, val_loader, device, label_columns):
+    model.eval()
+    all_probs = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Finding optimal thresholds"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            outputs = model(input_ids, attention_mask)
+            probs = torch.sigmoid(outputs)
+            
+            all_probs.append(probs.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+    
+    all_probs = np.vstack(all_probs)
+    all_labels = np.vstack(all_labels)
+    
+    optimal_thresholds = {}
+    
+    for i, label in enumerate(label_columns):
+        precisions, recalls, thresholds = precision_recall_curve(all_labels[:, i], all_probs[:, i])
+        # Calculate F1 for each threshold
+        f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
+        optimal_idx = np.argmax(f1_scores)
+        
+        # Get threshold that gives best F1 score
+        if optimal_idx < len(thresholds):
+            optimal_threshold = thresholds[optimal_idx]
         else:
-            logger.error(f"No model found at {self.model_path}")
+            optimal_threshold = 0.5  # Default if no optimal found
+            
+        optimal_thresholds[label] = optimal_threshold
+        logger.info(f"Optimal threshold for {label}: {optimal_threshold:.4f}")
+    
+    return optimal_thresholds
 
 
-class Predictor:
-    def __init__(self, model, processor, device, threshold=0.5):
+class ImprovedPredictor:
+    def __init__(self, model, processor, device, thresholds=None, correlation_matrix=None, label_columns=None):
         self.model = model
         self.processor = processor
         self.device = device
-        self.threshold = threshold
+        self.thresholds = thresholds if thresholds is not None else {label: 0.5 for label in label_columns}
+        self.correlation_matrix = correlation_matrix
+        self.label_columns = label_columns
+        
         self.model.to(device)
         self.model.eval()
         
@@ -295,11 +389,27 @@ class Predictor:
         
         with torch.no_grad():
             outputs = self.model(input_ids, attention_mask)
-            # Apply sigmoid to raw logits since model no longer has sigmoid
-            outputs = torch.sigmoid(outputs)
-            predictions = (outputs > self.threshold).float().cpu().numpy()
+            probs = torch.sigmoid(outputs).cpu().numpy()[0]
+        
+        # Apply category-specific thresholds
+        predictions = {}
+        for i, label in enumerate(self.label_columns):
+            threshold = self.thresholds[label]
+            predictions[label] = 1 if probs[i] > threshold else 0
+        
+        # Apply correlation-based post-processing
+        if self.correlation_matrix is not None:
+            # Handle negative correlation between 'toxic' and 'very_toxic'
+            toxic_idx = self.label_columns.index('toxic')
+            very_toxic_idx = self.label_columns.index('very_toxic')
             
-        return predictions
+            if predictions['toxic'] == 1 and predictions['very_toxic'] == 1:
+                if probs[toxic_idx] > probs[very_toxic_idx]:
+                    predictions['very_toxic'] = 0
+                else:
+                    predictions['toxic'] = 0
+        
+        return predictions, probs
     
     def predict_batch(self, texts):
         encodings = self.processor.transform_text_batch(texts)
@@ -309,11 +419,30 @@ class Predictor:
         
         with torch.no_grad():
             outputs = self.model(input_ids, attention_mask)
-            # Apply sigmoid to raw logits since model no longer has sigmoid
-            outputs = torch.sigmoid(outputs)
-            predictions = (outputs > self.threshold).float().cpu().numpy()
+            probs = torch.sigmoid(outputs).cpu().numpy()
+        
+        # Apply category-specific thresholds
+        batch_predictions = []
+        for i in range(probs.shape[0]):
+            predictions = {}
+            for j, label in enumerate(self.label_columns):
+                threshold = self.thresholds[label]
+                predictions[label] = 1 if probs[i, j] > threshold else 0
             
-        return predictions
+            # Apply correlation-based post-processing
+            if self.correlation_matrix is not None:
+                toxic_idx = self.label_columns.index('toxic')
+                very_toxic_idx = self.label_columns.index('very_toxic')
+                
+                if predictions['toxic'] == 1 and predictions['very_toxic'] == 1:
+                    if probs[i, toxic_idx] > probs[i, very_toxic_idx]:
+                        predictions['very_toxic'] = 0
+                    else:
+                        predictions['toxic'] = 0
+                        
+            batch_predictions.append(predictions)
+            
+        return batch_predictions, probs
 
 
 def visualize_data(df):
@@ -371,52 +500,17 @@ def visualize_data(df):
     plt.tight_layout()
     plt.savefig("toxicity_correlation.png", dpi=300, bbox_inches='tight')
     
-    non_toxic = (rowsum == 0).sum()
-    toxic = (rowsum > 0).sum()
-    multi_category = (rowsum > 1).sum()
-    
-    logger.info(f"Total comments: {len(df)}")
-    logger.info(f"Non-toxic comments: {non_toxic} ({non_toxic/len(df)*100:.2f}%)")
-    logger.info(f"Toxic comments: {toxic} ({toxic/len(df)*100:.2f}%)")
-    logger.info(f"Comments with multiple toxicity categories: {multi_category} ({multi_category/len(df)*100:.2f}%)")
-    logger.info(f"Total toxicity labels: {x.sum()}")
+    # Return the correlation matrix for use in the model
+    return corr
 
-def calculate_class_weights(df, label_columns):
-    logger.info("Calculating class weights...")
-    
-    class_counts = df[label_columns].sum().to_dict()
-    total_samples = len(df)
-    
-    class_weights = {}
-    for label, count in class_counts.items():
-        # Calculate positive weight for each class
-        # This represents how much to scale the positive examples vs negative ones
-        pos_weight = (total_samples - count) / (count + 1e-5)
-        class_weights[label] = pos_weight
-        
-    for label, weight in class_weights.items():
-        logger.info(f"Positive weight for {label}: {weight:.4f}")
-        
-    return class_weights
 
-class WeightedBCELoss(nn.Module):
-    def __init__(self, class_weights):
-        super(WeightedBCELoss, self).__init__()
-        self.class_weights = class_weights
-        self.weight_keys = list(class_weights.keys())
-        
-    def forward(self, outputs, targets):
-        weights = torch.ones(len(self.weight_keys), device=outputs.device)
-        for i, label in enumerate(self.weight_keys):
-            weights[i] = self.class_weights[label]
-            
-        loss = F.binary_cross_entropy(outputs, targets, reduction='none')
-        weighted_loss = loss * weights.unsqueeze(0)
-        return weighted_loss.mean()
+def create_correlation_matrix(df, label_columns):
+    return df[label_columns].corr()
+
 
 def main():
-    DATA_PATH = "FF.csv"
-    MODEL_PATH = "toxic_aiaoiaia_model.pt"
+    DATA_PATH = "finals_na_tagala-main/FF.csv"
+    MODEL_PATH = "toxic_detection_model.pt"
     MAX_LENGTH = 512
     BATCH_SIZE = 8
     NUM_EPOCHS = 10
@@ -424,7 +518,7 @@ def main():
     HIDDEN_DIM = 128
     VALIDATION_SPLIT = 0.1
     
-    TOXICITY_LABELS = ['toxic', 'very toxic', 'profanity', 'threat', 'insult', 'identity_hate']
+    TOXICITY_LABELS = ['toxic', 'very_toxic', 'profanity', 'threat', 'insult', 'identity hate']
     
     logger.info(f"Loading data from {DATA_PATH}")
     df = pd.read_csv(DATA_PATH)
@@ -434,15 +528,16 @@ def main():
     for label, count in toxicity_counts.items():
         logger.info(f"{label}: {count} instances ({count/len(df)*100:.2f}%)")
     
-    visualize_data(df)
+    # Visualize and get correlation matrix
+    correlation_matrix = visualize_data(df)
     
     processor = TextProcessor(max_length=MAX_LENGTH)
     
     X = df['comment']
-    y = df.iloc[:, 1:]
+    y = df[TOXICITY_LABELS]
     
     X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.3, random_state=SEED, stratify=df.iloc[:, 1:].sum(axis=1)
+        X, y, test_size=0.3, random_state=SEED, stratify=df[TOXICITY_LABELS].sum(axis=1)
     )
     
     val_ratio = VALIDATION_SPLIT / 0.3
@@ -500,15 +595,18 @@ def main():
         optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
     
-    # Always calculate class weights for imbalanced multi-label classification
-    class_weights = calculate_class_weights(df, y.columns)
+    # Calculate positive weights for each class for imbalanced dataset
+    pos_weight = torch.FloatTensor([
+        (len(df) - df[label].sum()) / (df[label].sum() + 1e-5)
+        for label in TOXICITY_LABELS
+    ]).to(device)
     
-    # Convert class weights to tensor format for BCEWithLogitsLoss
-    pos_weight = torch.FloatTensor([class_weights[label] for label in y.columns]).to(device)
-    
-    # Use BCEWithLogitsLoss with class weights for multi-label classification
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    logger.info("Using BCEWithLogitsLoss with positive class weights")
+    # Use correlation-aware Focal Loss
+    criterion = FocalLoss(
+        pos_weight=pos_weight,
+        gamma=2.0,
+        correlation_matrix=correlation_matrix.values if correlation_matrix is not None else None
+    )
     
     trainer = TextClassificationTrainer(
         model=model,
@@ -525,22 +623,40 @@ def main():
     
     trainer.load_model()
     
-    model.eval()
+    # Optimize thresholds for each category
+    optimal_thresholds = optimize_thresholds(model, val_loader, device, TOXICITY_LABELS)
+    
+    # Evaluate with optimized thresholds
+    predictor = ImprovedPredictor(
+        model=model,
+        processor=processor,
+        device=device,
+        thresholds=optimal_thresholds,
+        correlation_matrix=correlation_matrix,
+        label_columns=TOXICITY_LABELS
+    )
+    
+    # Test set evaluation
     all_preds = []
     all_labels = []
     
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            
-            outputs = model(input_ids, attention_mask)
-            outputs = torch.sigmoid(outputs)  # Apply sigmoid to raw logits
-            preds = (outputs > 0.5).float()
-            
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
+    for batch in tqdm(test_loader, desc="Testing"):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].cpu().numpy()
+        
+        batch_texts = [processor.tokenizer.decode(ids, skip_special_tokens=True) 
+                       for ids in input_ids]
+        predictions, _ = predictor.predict_batch(batch_texts)
+        
+        # Convert predictions to array format
+        pred_array = np.zeros((len(predictions), len(TOXICITY_LABELS)))
+        for i, pred_dict in enumerate(predictions):
+            for j, label in enumerate(TOXICITY_LABELS):
+                pred_array[i, j] = pred_dict[label]
+        
+        all_preds.append(pred_array)
+        all_labels.append(labels)
     
     all_preds = np.vstack(all_preds)
     all_labels = np.vstack(all_labels)
@@ -551,41 +667,33 @@ def main():
     
     logger.info(f"Test Results - Accuracy: {accuracy:.4f}, F1 (micro): {f1_micro:.4f}, F1 (macro): {f1_macro:.4f}")
     logger.info("\nClassification Report:")
-    logger.info(classification_report(all_labels, all_preds, target_names=y.columns))
+    logger.info(classification_report(all_labels, all_preds, target_names=TOXICITY_LABELS))
     
-    predictor = Predictor(model, processor, device)
-    
-    logger.info("\nDemo Predictions:")
-    
-    sample_text1 = "This is a normal comment about the weather today."
-    prediction1 = predictor.predict(sample_text1)
-    logger.info(f"Text: {sample_text1}")
-    logger.info(f"Prediction: {prediction1}")
-    
-    sample_text2 = "I strongly disagree with your opinion and think you should reconsider."
-    prediction2 = predictor.predict(sample_text2)
-    logger.info(f"Text: {sample_text2}")
-    logger.info(f"Prediction: {prediction2}")
-    
+    # Interactive demo
     print("\nToxicity Detection Mode (type 'exit' to quit):")
-    print(f"This model detects the following types of toxic content: {', '.join(y.columns)}")
-    while True:
-        user_input = input("Enter a comment to analyze for toxicity: ")
-        if user_input.lower() == 'exit':
-            break
+    print(f"This model detects the following types of toxic content: {', '.join(TOXICITY_LABELS)}")
+    try:
+        while True:
+            user_input = input("Enter a comment to analyze for toxicity: ")
+            if user_input.lower() == 'exit':
+                break
+                
+            prediction, probabilities = predictor.predict(user_input)
             
-        prediction = predictor.predict(user_input)
-        class_predictions = {y.columns[i]: pred for i, pred in enumerate(prediction[0])}
-        
-        print("Toxicity analysis:")
-        has_toxicity = False
-        for label, value in class_predictions.items():
-            if value > 0:
-                has_toxicity = True
-                print(f"- {label.replace('_', ' ').title()}: Detected")
-        
-        if not has_toxicity:
-            print("- No toxic content detected")
+            print("Toxicity analysis:")
+            has_toxicity = False
+            for label, value in prediction.items():
+                prob = probabilities[TOXICITY_LABELS.index(label)]
+                if value > 0:
+                    has_toxicity = True
+                    print(f"- {label.replace('_', ' ').title()}: Detected (confidence: {prob:.2f})")
+            
+            if not has_toxicity:
+                print("- No toxic content detected")
+    finally:
+        # Clean up resources
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
