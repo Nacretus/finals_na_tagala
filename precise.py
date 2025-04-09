@@ -497,7 +497,7 @@ def visualize_data(df):
 
 
 def main():
-    DATA_PATH = "/content/drive/MyDrive/things/FF.csv"
+    DATA_PATH = "FF.csv"
     MODEL_PATH = "toxic_classifier_model.pt"
     MAX_LENGTH = 512
     BATCH_SIZE = 24
