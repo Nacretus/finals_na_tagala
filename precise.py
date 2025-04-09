@@ -221,7 +221,7 @@ class TextClassificationTrainer:
         optimizer,
         scheduler=None,
         device=torch.device("cpu"),
-        model_path="text_classifier_model.pt",
+        model_path="toxic_classifier_model.pt",
         label_columns=None
     ):
         self.model = model
