@@ -315,7 +315,7 @@ class TextClassificationTrainer:
         return val_loss / len(self.val_loader), accuracy, f1, all_outputs, all_labels, auc_scores, precision_scores, recall_scores
     
     def calibrate_thresholds(self, min_precision=0.85, min_recall=0.3):
-        _, _, _, all_outputs, all_labels, _ = self.evaluate()
+        _, _, _, all_outputs, all_labels, _, _, _ = self.evaluate()
         optimal_thresholds = {}
         
         for i, label in enumerate(self.label_columns):
