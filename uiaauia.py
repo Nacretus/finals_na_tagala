@@ -509,16 +509,17 @@ def create_correlation_matrix(df, label_columns):
 
 
 def main():
-    DATA_PATH = "finals_na_tagala-main/FF.csv"
+    DATA_PATH = "FF.csv"
     MODEL_PATH = "toxic_detection_model.pt"
     MAX_LENGTH = 512
     BATCH_SIZE = 8
-    NUM_EPOCHS = 10
-    LEARNING_RATE = 1e-4
+    NUM_EPOCHS = 15
+    BERT_LEARNING_RATE = 3e-5  # Lower learning rate for fine-tuning BERT
+    NON_BERT_LEARNING_RATE = 1e-4  # Original learning rate for task-specific layers
     HIDDEN_DIM = 128
     VALIDATION_SPLIT = 0.1
     
-    TOXICITY_LABELS = ['toxic', 'very_toxic', 'profanity', 'threat', 'insult', 'identity hate']
+    TOXICITY_LABELS = ['toxic', 'insult', 'profanity', 'threat',  'identity hate', 'very_toxic']
     
     logger.info(f"Loading data from {DATA_PATH}")
     df = pd.read_csv(DATA_PATH)
@@ -574,126 +575,132 @@ def main():
         num_workers=num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
-    
+        
     num_classes = y.shape[1]
     model = EfficientTextClassifier(
-        hidden_dim=HIDDEN_DIM,
-        num_classes=num_classes,
-        dropout_rate=0.3
-    ).to(device)
-    
+            hidden_dim=HIDDEN_DIM,
+            num_classes=num_classes,
+            dropout_rate=0.3
+        ).to(device)
+        
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params:.2%} of total)")
-    
-    optimizer = optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], 
-        lr=LEARNING_RATE
-    )
-    
+        
+        # Create parameter groups with different learning rates
+    bert_parameters = [p for n, p in model.named_parameters() 
+                          if "bert" in n and p.requires_grad]
+    non_bert_parameters = [p for n, p in model.named_parameters() 
+                              if "bert" not in n and p.requires_grad]
+        
+    optimizer = optim.AdamW([
+            {'params': bert_parameters, 'lr': BERT_LEARNING_RATE},  # Lower LR for BERT
+            {'params': non_bert_parameters, 'lr': NON_BERT_LEARNING_RATE}  # Higher LR for task-specific layers
+        ])
+        
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
-    )
-    
-    # Calculate positive weights for each class for imbalanced dataset
+            optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        )
+        
+        # Calculate positive weights for each class for imbalanced dataset
     pos_weight = torch.FloatTensor([
-        (len(df) - df[label].sum()) / (df[label].sum() + 1e-5)
-        for label in TOXICITY_LABELS
-    ]).to(device)
-    
-    # Use correlation-aware Focal Loss
+            (len(df) - df[label].sum()) / (df[label].sum() + 1e-5)
+            for label in TOXICITY_LABELS
+        ]).to(device)
+        
+        # Use correlation-aware Focal Loss
     criterion = FocalLoss(
-        pos_weight=pos_weight,
-        gamma=2.0,
-        correlation_matrix=correlation_matrix.values if correlation_matrix is not None else None
-    )
-    
+            pos_weight=pos_weight,
+            gamma=2.0,
+            correlation_matrix=correlation_matrix.values if correlation_matrix is not None else None
+        )
+        
     trainer = TextClassificationTrainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        model_path=MODEL_PATH
-    )
-    
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            model_path=MODEL_PATH
+        )
+        
     trainer.train(NUM_EPOCHS, patience=3)
-    
+        
     trainer.load_model()
-    
-    # Optimize thresholds for each category
+        
+        # Optimize thresholds for each category
     optimal_thresholds = optimize_thresholds(model, val_loader, device, TOXICITY_LABELS)
-    
-    # Evaluate with optimized thresholds
+        
+        # Evaluate with optimized thresholds
     predictor = ImprovedPredictor(
-        model=model,
-        processor=processor,
-        device=device,
-        thresholds=optimal_thresholds,
-        correlation_matrix=correlation_matrix,
-        label_columns=TOXICITY_LABELS
-    )
-    
-    # Test set evaluation
+            model=model,
+            processor=processor,
+            device=device,
+            thresholds=optimal_thresholds,
+            correlation_matrix=correlation_matrix,
+            label_columns=TOXICITY_LABELS
+        )
+        
+        # Test set evaluation
     all_preds = []
     all_labels = []
-    
+        
     for batch in tqdm(test_loader, desc="Testing"):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].cpu().numpy()
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].cpu().numpy()
+            
+            batch_texts = [processor.tokenizer.decode(ids, skip_special_tokens=True) 
+                           for ids in input_ids]
+            predictions, _ = predictor.predict_batch(batch_texts)
+            
+            # Convert predictions to array format
+            pred_array = np.zeros((len(predictions), len(TOXICITY_LABELS)))
+            for i, pred_dict in enumerate(predictions):
+                for j, label in enumerate(TOXICITY_LABELS):
+                    pred_array[i, j] = pred_dict[label]
+            
+            all_preds.append(pred_array)
+            all_labels.append(labels)
         
-        batch_texts = [processor.tokenizer.decode(ids, skip_special_tokens=True) 
-                       for ids in input_ids]
-        predictions, _ = predictor.predict_batch(batch_texts)
-        
-        # Convert predictions to array format
-        pred_array = np.zeros((len(predictions), len(TOXICITY_LABELS)))
-        for i, pred_dict in enumerate(predictions):
-            for j, label in enumerate(TOXICITY_LABELS):
-                pred_array[i, j] = pred_dict[label]
-        
-        all_preds.append(pred_array)
-        all_labels.append(labels)
-    
     all_preds = np.vstack(all_preds)
     all_labels = np.vstack(all_labels)
-    
+        
     accuracy = accuracy_score(all_labels.flatten(), all_preds.flatten())
     f1_micro = f1_score(all_labels, all_preds, average='micro')
     f1_macro = f1_score(all_labels, all_preds, average='macro')
-    
+        
     logger.info(f"Test Results - Accuracy: {accuracy:.4f}, F1 (micro): {f1_micro:.4f}, F1 (macro): {f1_macro:.4f}")
     logger.info("\nClassification Report:")
     logger.info(classification_report(all_labels, all_preds, target_names=TOXICITY_LABELS))
-    
-    # Interactive demo
+        
+        # Interactive demo
     print("\nToxicity Detection Mode (type 'exit' to quit):")
     print(f"This model detects the following types of toxic content: {', '.join(TOXICITY_LABELS)}")
     try:
-        while True:
-            user_input = input("Enter a comment to analyze for toxicity: ")
-            if user_input.lower() == 'exit':
-                break
+            while True:
+                user_input = input("Enter a comment to analyze for toxicity: ")
+                if user_input.lower() == 'exit':
+                    break
+                    
+                prediction, probabilities = predictor.predict(user_input)
                 
-            prediction, probabilities = predictor.predict(user_input)
-            
-            print("Toxicity analysis:")
-            has_toxicity = False
-            for label, value in prediction.items():
-                prob = probabilities[TOXICITY_LABELS.index(label)]
-                if value > 0:
-                    has_toxicity = True
-                    print(f"- {label.replace('_', ' ').title()}: Detected (confidence: {prob:.2f})")
-            
-            if not has_toxicity:
-                print("- No toxic content detected")
+                print("Toxicity analysis:")
+                has_toxicity = False
+                for label, value in prediction.items():
+                    prob = probabilities[TOXICITY_LABELS.index(label)]
+                    if value > 0:
+                        has_toxicity = True
+                        print(f"- {label.replace('_', ' ').title()}: Detected (confidence: {prob:.2f})")
+                
+                if not has_toxicity:
+                    print("- No toxic content detected")
     finally:
-        # Clean up resources
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # Clean up resources
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
